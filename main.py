@@ -1,13 +1,21 @@
 import os
+import re
 import time
 from groq import Groq
 from fastapi import FastAPI, Form, Response, BackgroundTasks, Request
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 from dotenv import load_dotenv
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from pymongo import MongoClient
+import certifi
 
 # Load environment variables
-load_dotenv()
+# Load environment variables from absolute path
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(dotenv_path=env_path)
+print(f"--- [DEBUG] Loading env from: {env_path}")
 
 app = FastAPI()
 
@@ -26,43 +34,348 @@ try:
 except Exception as e:
     print(f"--- [ERROR] Initialization failed: {e} ---")
 
-# NEW: Super Simple English Persona
+# Savitri Prompt - STRICT rules to prevent hallucination
 SAVITRI_PROMPT = """
-You are Savitri, a very kind and simple AI teacher for girls in India.
-- Use VERY SIMPLE English words.
-- Speak slowly in your mind so you use short sentences.
-- Use only common words that a 10th-grade girl in a village would know.
-1. First, ask for the Chapter.
-2. Then, ask for the Mode (Concept, Practice, or Revision).
-3. Then, start the lesson.
+You are Savitri, a strict Class 10 Science tutor for Indian students.
+
+=== ABSOLUTE RULES (NEVER BREAK THESE) ===
+1. You will be told which chapter is locked. NEVER mention or teach any other chapter.
+2. You will be given textbook context. USE ONLY THAT CONTEXT. Do not use any outside knowledge.
+3. If context is empty or irrelevant, say EXACTLY: "I could not find that in our textbook. Please try again."
+4. NEVER say things like "In many textbooks, Chapter 6 is...". You only know what the context says.
+5. DO NOT mention any chapter number or name other than the locked one.
+6. Use simple English for a 10th-grade student.
+
+=== MODES ===
+CONCEPT mode: Give exactly 3 bullet points from the context. End with: "Do you have any doubts?"
+QUIZ mode: Ask 1 MCQ at a time (4 options: A, B, C, D). Wait for answer. After 3 questions give a score.
+REVISION mode: List 5 key exam points from the context only.
 """
+
+def normalize(text):
+    return str(text).lower().strip().replace("&", "and")
 
 # Voice Settings
 VOICE_NAME = "Polly.Aditi" # Premium Indian Female Voice
 LANGUAGE_CODE = "en-IN"
 
+# Vector DB Setup (MongoDB Atlas)
+MONGODB_URI = os.getenv("MONGODB_URI")
+DB_NAME = "callsakhi"
+COLLECTION_NAME = "knowledge"
+ATLAS_VECTOR_SEARCH_INDEX_NAME = "vector_index"
+
+embeddings = None
+vector_search = None
+
+def load_db():
+    global vector_search, embeddings
+    print("--- [AI] Starting Database Initialization... ---", flush=True)
+    
+    current_uri = os.getenv("MONGODB_URI")
+    if not current_uri:
+        print("--- [WARNING] MONGODB_URI is empty or None! ---", flush=True)
+        return
+
+    print(f"--- [DEBUG] Using MONGODB_URI: {current_uri[:15]}... (Length: {len(current_uri)})", flush=True)
+
+    try:
+        print("--- [AI] Connecting to MongoDB Atlas... ---", flush=True)
+        # Using both options for maximum compatibility
+        client = MongoClient(
+            current_uri, 
+            tls=True,
+            tlsCAFile=certifi.where(),
+            tlsAllowInvalidCertificates=True, 
+            serverSelectionTimeoutMS=15000 
+        )
+        
+        print("--- [AI] Pinging MongoDB... ---", flush=True)
+        try:
+            client.admin.command('ping')
+            print("--- [AI] Ping successful! ---", flush=True)
+        except Exception as ping_err:
+            print(f"--- [WARNING] Ping failed but proceeding: {ping_err} ---", flush=True)
+
+        collection = client[DB_NAME][COLLECTION_NAME]
+        
+        # Initialize embeddings ONLY after successful DB connection
+        if embeddings is None:
+            print("--- [AI] Loading Embedding Model (this may take a minute)... ---", flush=True)
+            embeddings = HuggingFaceEmbeddings(
+                model_name='sentence-transformers/all-MiniLM-L6-v2', 
+                model_kwargs={'device': 'cpu'}
+            )
+            print("--- [AI] Embedding Model Loaded! ---", flush=True)
+            
+        print("--- [AI] Initializing Vector Search... ---", flush=True)
+        vector_search = MongoDBAtlasVectorSearch(
+            collection=collection,
+            embedding=embeddings,
+            index_name=ATLAS_VECTOR_SEARCH_INDEX_NAME,
+            text_key="text"  # CRITICAL: the field in MongoDB is 'text', not 'page_content'
+        )
+        print("--- [SUCCESS] Connected to MongoDB Atlas Vector Search ---", flush=True)
+    except Exception as e:
+        print(f"--- [ERROR] Database Initialization failed: {e} ---", flush=True)
+        import traceback
+        traceback.print_exc()
+
+@app.on_event("startup")
+async def startup_event():
+    load_db()
+
 # Session storage (Key: CallSid)
 sessions = {}
+session_state = {} # Stores locked chapter and stage
+
+CHAPTER_MAPPING = {
+    "1": "chemical reactions and equations",
+    "2": "acids, bases and salts",
+    "3": "metals and non-metals",
+    "4": "carbon and its compounds",
+    "5": "life processes",
+    "6": "control and coordination",
+    "7": "how do organisms reproduce",
+    "8": "heredity",
+    "9": "light – reflection and refraction",
+    "10": "the human eye and the colourful world",
+    "11": "electricity",
+    "12": "magnetic effects of electric current",
+    "13": "our environment"
+}
+
+def get_chapter_from_input(user_input):
+    user_input_norm = normalize(user_input)
+    # Check for direct number match
+    if user_input_norm in CHAPTER_MAPPING:
+        return CHAPTER_MAPPING[user_input_norm], user_input_norm
+    
+    # Robust matching: remove punctuation and handle minor variations
+    def clean_text(t):
+        # Remove common punctuation and normalize spaces
+        for char in [",", ".", "-", "–", "?", "!"]:
+            t = t.replace(char, " ")
+        words = t.lower().split()
+        # Robustness: ignore trailing 's' to handle plural vs singular
+        words = [w.rstrip('s') for w in words]
+        return " ".join(words)
+
+    cleaned_input = clean_text(user_input_norm)
+    for num, name in CHAPTER_MAPPING.items():
+        cleaned_name = clean_text(name)
+        # Check for partial matches or keyword overlaps
+        if cleaned_name in cleaned_input or cleaned_input in cleaned_name:
+            return name, num
+            
+    return None, None
+
+def get_relevant_context(query, chapter=None):
+    if vector_search:
+        try:
+            search_kwargs = {"k": 5}
+            if chapter:
+                # CRITICAL FIX: the field in MongoDB is flat 'chapter', NOT 'metadata.chapter'
+                search_kwargs["pre_filter"] = {"chapter": {"$eq": chapter}}
+                query = f"{chapter} {query}"
+            
+            docs = vector_search.similarity_search(query, **search_kwargs)
+            if not docs:
+                print(f"--- [WARNING] No documents found in chapter '{chapter}' for query: {query} ---")
+            else:
+                print(f"--- [RAG] Found {len(docs)} chunks for chapter '{chapter}' ---")
+            return "\n".join([doc.page_content for doc in docs])
+        except Exception as e:
+            print(f"--- [ERROR] MongoDB Search failed: {e} ---")
+    else:
+        print("--- [ERROR] Vector Search not initialized ---")
+    return ""
+
+MODE_MENU = "Press 1 for Concept Explanation, 2 for Quiz, or 3 for Revision."
+
+def _run_llm(messages, max_tokens=250):
+    completion = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=messages,
+        max_tokens=max_tokens
+    )
+    return completion.choices[0].message.content
 
 def get_ai_response(call_sid, user_input):
     try:
         if call_sid not in sessions:
             sessions[call_sid] = [{"role": "system", "content": SAVITRI_PROMPT}]
-        
-        sessions[call_sid].append({"role": "user", "content": user_input})
-        
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=sessions[call_sid],
-            max_tokens=150
-        )
-        
-        ai_text = completion.choices[0].message.content
-        sessions[call_sid].append({"role": "assistant", "content": ai_text})
-        return ai_text
+
+        user_input_norm = normalize(user_input)
+
+        if call_sid not in session_state:
+            session_state[call_sid] = {
+                "chapter": None, "chapter_num": None, "stage": "chapter_selection",
+                "mode": None,
+                "quiz_q_num": 0, "quiz_score": 0,
+                "quiz_awaiting_answer": False, "quiz_correct_answer": None
+            }
+
+        state = session_state[call_sid]
+
+        # ── STAGE 1: CHAPTER SELECTION ──────────────────────────────────
+        if state["stage"] == "chapter_selection":
+            chapter_name, chapter_num = get_chapter_from_input(user_input)
+            if chapter_name:
+                state.update({"chapter": chapter_name, "chapter_num": chapter_num, "stage": "mode_selection"})
+                ai_text = (f"Perfect! Chapter {chapter_num}: {chapter_name.title()} is now locked. "
+                           f"What do you want to do? {MODE_MENU}")
+                sessions[call_sid].append({"role": "user", "content": user_input})
+                sessions[call_sid].append({"role": "assistant", "content": ai_text})
+                print(f"--- [LOCKED] Chapter: {chapter_name} (#{chapter_num}) for {call_sid} ---")
+                return ai_text
+            return "I could not find that chapter. Please say a number from 1 to 13."
+
+        chapter     = state["chapter"]
+        chapter_num = state["chapter_num"]
+        print(f"--- [CHAPTER LOCKED] Using: {chapter} for {call_sid} ---")
+
+        # ── STAGE 2: MODE SELECTION ──────────────────────────────────────
+        def is_mode(inp, num, *keywords):
+            return inp == num or any(k in inp for k in keywords)
+
+        if state["stage"] == "mode_selection":
+            if is_mode(user_input_norm, "1", "concept", "explanation"):
+                state.update({"stage": "learning", "mode": "explain"})
+            elif is_mode(user_input_norm, "2", "quiz", "question"):
+                state.update({"stage": "learning", "mode": "quiz",
+                              "quiz_q_num": 0, "quiz_score": 0,
+                              "quiz_awaiting_answer": False, "quiz_correct_answer": None})
+            elif is_mode(user_input_norm, "3", "revision", "summary", "revise"):
+                state.update({"stage": "learning", "mode": "revision"})
+            else:
+                return f"Please choose: press 1 for Concept, 2 for Quiz, or 3 for Revision for {chapter.title()}."
+
+        # ── STAGE 3: LEARNING ────────────────────────────────────────────
+        mode = state.get("mode", "explain")
+
+        # Allow mode switch ONLY when NOT waiting for a quiz answer
+        if state["stage"] == "learning" and not state.get("quiz_awaiting_answer"):
+            if is_mode(user_input_norm, "1", "concept", "explanation") and mode != "explain":
+                state.update({"mode": "explain"}); mode = "explain"
+            elif is_mode(user_input_norm, "2", "quiz", "question") and mode != "quiz":
+                state.update({"mode": "quiz", "quiz_q_num": 0, "quiz_score": 0,
+                              "quiz_awaiting_answer": False, "quiz_correct_answer": None}); mode = "quiz"
+            elif is_mode(user_input_norm, "3", "revision", "summary", "revise") and mode != "revision":
+                state.update({"mode": "revision"}); mode = "revision"
+
+        # ── QUIZ: ANSWER CHECKING ────────────────────────────────────────
+        if mode == "quiz" and state.get("quiz_awaiting_answer"):
+            correct = state.get("quiz_correct_answer", "1")
+            if user_input_norm in ["1", "2", "3", "4"]:
+                q_num = state["quiz_q_num"]
+                if user_input_norm == correct:
+                    state["quiz_score"] += 1
+                    feedback = "That is correct! Well done."
+                else:
+                    letter = {"1":"A","2":"B","3":"C","4":"D"}.get(correct, correct)
+                    feedback = f"That is not correct. The right answer is option {letter}."
+
+                if q_num >= 3:
+                    # Quiz finished
+                    score = state["quiz_score"]
+                    state.update({"quiz_awaiting_answer": False, "quiz_q_num": 0, "stage": "mode_selection"})
+                    ai_text = (f"{feedback} Quiz complete! Your score is {score} out of 3. "
+                               f"{MODE_MENU}")
+                    sessions[call_sid].append({"role": "assistant", "content": ai_text})
+                    print(f"--- [AI] Response: {ai_text} ---")
+                    return ai_text
+                else:
+                    # Next question
+                    state["quiz_awaiting_answer"] = False
+                    return _generate_quiz_question(call_sid, chapter, chapter_num, state, prefix=feedback + " Next question. ")
+            else:
+                return "Please press 1, 2, 3, or 4 to choose your answer."
+
+        # ── CONCEPT ──────────────────────────────────────────────────────
+        if mode == "explain":
+            context = get_relevant_context(f"main concepts definition of {chapter}", chapter=chapter)
+            start = time.time()
+            if context:
+                prompt = (f"LOCKED CHAPTER: {chapter}. Mode: CONCEPT.\n"
+                          f"USE ONLY this textbook context:\n---\n{context}\n---\n"
+                          f"Give exactly 3 bullet points on the key concepts. "
+                          f"After the points end with exactly: '{MODE_MENU}'")
+            else:
+                return f"I could not find content for {chapter.title()}. {MODE_MENU}"
+            ai_text = "You have chosen Concept Explanation. " + _run_llm(
+                sessions[call_sid] + [{"role": "user", "content": prompt}])
+            print(f"--- [DEBUG] LLM took {time.time()-start:.2f}s | [AI] {ai_text} ---")
+            sessions[call_sid].append({"role": "assistant", "content": ai_text})
+            return ai_text
+
+        # ── REVISION ─────────────────────────────────────────────────────
+        if mode == "revision":
+            context = get_relevant_context(f"important points summary of {chapter}", chapter=chapter)
+            start = time.time()
+            if context:
+                prompt = (f"LOCKED CHAPTER: {chapter}. Mode: REVISION.\n"
+                          f"USE ONLY this textbook context:\n---\n{context}\n---\n"
+                          f"List exactly 5 numbered key exam points. "
+                          f"After the points end with exactly: '{MODE_MENU}'")
+            else:
+                return f"I could not find revision content for {chapter.title()}. {MODE_MENU}"
+            ai_text = "You have chosen Revision. " + _run_llm(
+                sessions[call_sid] + [{"role": "user", "content": prompt}])
+            print(f"--- [DEBUG] LLM took {time.time()-start:.2f}s | [AI] {ai_text} ---")
+            sessions[call_sid].append({"role": "assistant", "content": ai_text})
+            return ai_text
+
+        # ── QUIZ: GENERATE NEW QUESTION ───────────────────────────────────
+        if mode == "quiz":
+            return _generate_quiz_question(call_sid, chapter, chapter_num, state, is_first=(state["quiz_q_num"] == 0))
+
+        return f"Please press 1 for Concept, 2 for Quiz, or 3 for Revision."
+
     except Exception as e:
         print(f"--- [ERROR] Groq failed for {call_sid}: {e} ---")
         return "I'm sorry, I missed that. Can you say it again?"
+
+
+def _generate_quiz_question(call_sid, chapter, chapter_num, state, is_first=False, prefix=""):
+    """Generate one MCQ, store correct answer, return display text."""
+    state["quiz_q_num"] = state.get("quiz_q_num", 0) + 1
+    q_num = state["quiz_q_num"]
+    context = get_relevant_context(f"questions answers examples of {chapter}", chapter=chapter)
+    print(f"--- [QUIZ] Generating question {q_num} for '{chapter}' ---")
+
+    prompt = (
+        f"LOCKED CHAPTER: {chapter}. Mode: QUIZ. Question {q_num} of 3.\n"
+        f"USE ONLY this textbook context:\n---\n{context}\n---\n"
+        f"Generate 1 multiple choice question. IMPORTANT: place the correct answer at a RANDOM position (not always option 3 or 4).\n"
+        f"Use this EXACT format with no extra text:\n"
+        f"Question {q_num}: [question]\n"
+        f"1. [option]\n2. [option]\n3. [option]\n4. [option]\n"
+        f"[ANSWER:X]\n"
+        f"Replace X with the digit 1, 2, 3, or 4 that is the correct option. [ANSWER:X] must be the very last line."
+    )
+    raw = _run_llm(sessions[call_sid] + [{"role": "user", "content": prompt}], max_tokens=200)
+    print(f"--- [QUIZ RAW] {raw} ---")
+
+    # Try multiple parsing patterns for robustness
+    match = (re.search(r'\[ANSWER:(\d)\]', raw) or
+             re.search(r'ANSWER:\s*(\d)', raw) or
+             re.search(r'ANSWER\s+(\d)', raw))
+    if match:
+        state["quiz_correct_answer"] = match.group(1)
+        display = re.sub(r'(\[ANSWER:\d\]|ANSWER:?\s*\d)', '', raw).strip()
+    else:
+        state["quiz_correct_answer"] = "1"
+        display = raw.strip()
+        print(f"--- [QUIZ WARNING] Could not parse answer from response, defaulting to 1 ---")
+
+    state["quiz_awaiting_answer"] = True
+
+    intro = "You have chosen Quiz. " if is_first else ""
+    ai_text = f"{intro}{prefix}{display} Press 1, 2, 3, or 4 to answer."
+    sessions[call_sid].append({"role": "assistant", "content": ai_text})
+    print(f"--- [AI] Response: {ai_text} ---")
+    return ai_text
 
 def trigger_callback(user_number: str):
     time.sleep(3)
@@ -107,9 +420,12 @@ async def voice_callback(CallSid: str = Form(None), request: Request = None):
     greeting = "Namaste! I am Savitri, your teacher. Which Science chapter do you want to study today?"
     
     gather = response.gather(
-        input="speech", 
+        input="speech dtmf", 
         action=f"{BASE_URL}/handle-response", 
-        timeout=5, 
+        timeout=3,
+        numDigits=2, # Support up to chapter 13
+        speechTimeout="1",
+        speechModel="phone_call",
         language=LANGUAGE_CODE
     )
     gather.say(greeting, voice=VOICE_NAME, language=LANGUAGE_CODE)
@@ -119,33 +435,59 @@ async def voice_callback(CallSid: str = Form(None), request: Request = None):
     return Response(content=str(response), media_type="application/xml")
 
 @app.api_route("/handle-response", methods=["GET", "POST"])
-async def handle_response(CallSid: str = Form(None), SpeechResult: str = Form(None), request: Request = None):
+async def handle_response(CallSid: str = Form(None), SpeechResult: str = Form(None), Digits: str = Form(None), request: Request = None):
     if not CallSid:
         CallSid = request.query_params.get("CallSid", "unknown")
-    if not SpeechResult:
-        SpeechResult = request.query_params.get("SpeechResult")
-
-    print(f"--- [RESPONSE] CallSid: {CallSid}, User said: {SpeechResult} ---")
+    
+    user_input = Digits or SpeechResult
+    print(f"--- [RESPONSE] CallSid: {CallSid}, User said/typed: {user_input} ---")
     response = VoiceResponse()
     
-    if not SpeechResult:
-        response.say("I did not hear you. Please speak again.", voice=VOICE_NAME, language=LANGUAGE_CODE)
-        response.redirect(f"{BASE_URL}/voice-callback")
+    if not user_input:
+        # Don't restart from beginning if student is in an active session
+        current_stage = session_state.get(CallSid, {}).get("stage", "chapter_selection")
+        quiz_waiting  = session_state.get(CallSid, {}).get("quiz_awaiting_answer", False)
+
+        if current_stage in ["mode_selection", "learning"]:
+            if quiz_waiting:
+                repeat_msg = "I did not hear you. Please press 1, 2, 3, or 4 to answer."
+            else:
+                repeat_msg = "I did not hear you. Please press 1 for Concept, 2 for Quiz, or 3 for Revision."
+        else:
+            repeat_msg = None
+
+        if repeat_msg:
+            gather = response.gather(
+                input="speech dtmf",
+                action=f"{BASE_URL}/handle-response",
+                timeout=8, numDigits=1,
+                speechTimeout="2", speechModel="phone_call", language=LANGUAGE_CODE
+            )
+            gather.say(repeat_msg, voice=VOICE_NAME, language=LANGUAGE_CODE)
+            response.redirect(f"{BASE_URL}/handle-response")
+        else:
+            response.redirect(f"{BASE_URL}/voice-callback")
         return Response(content=str(response), media_type="application/xml")
 
-    ai_text = get_ai_response(CallSid, SpeechResult)
-    
+    ai_text = get_ai_response(CallSid, user_input)
+
+    if any(bye in ai_text.lower() for bye in ["goodbye", "namaste and goodbye"]):
+        response.say(ai_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.hangup()
+        print(f"--- [HANGUP] Ending call for {CallSid} ---")
+        return Response(content=str(response), media_type="application/xml")
+
     gather = response.gather(
-        input="speech", 
-        action=f"{BASE_URL}/handle-response", 
-        timeout=5, 
+        input="speech dtmf",
+        action=f"{BASE_URL}/handle-response",
+        timeout=8,        # longer wait after AI speaks
+        numDigits=1,      # captures 1-4 (all single digits)
+        speechTimeout="2",
+        speechModel="phone_call",
         language=LANGUAGE_CODE
     )
     gather.say(ai_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
-    
-    # Ensure call doesn't just end if they stay silent after AI speaks
     response.redirect(f"{BASE_URL}/handle-response")
-    
     return Response(content=str(response), media_type="application/xml")
 
 if __name__ == "__main__":

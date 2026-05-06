@@ -5,3 +5,10 @@ python-dotenv
 groq
 python-multipart
 requests
+faiss-cpu
+sentence-transformers
+langchain
+langchain-community
+pypdf
+pymongo[srv]
+langchain-mongodb
