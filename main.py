@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from services.db_service import save_message
 from groq import Groq
 from fastapi import FastAPI, Form, Response, BackgroundTasks, Request
 from twilio.rest import Client
@@ -86,8 +87,8 @@ def load_db():
             current_uri, 
             tls=True,
             tlsCAFile=certifi.where(),
-            tlsAllowInvalidCertificates=True, 
-            serverSelectionTimeoutMS=15000 
+            # tlsAllowInvalidCertificates=True, 
+            serverSelectionTimeoutMS=30000 
         )
         
         print("--- [AI] Pinging MongoDB... ---", flush=True)
@@ -384,11 +385,61 @@ def trigger_callback(user_number: str):
         client.calls.create(
             to=user_number,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{BASE_URL}/voice-callback"
+            url=f"{BASE_URL}/voice-callback",
+            status_callback=f"{BASE_URL}/call-status",
+            status_callback_event=['completed']
         )
     except Exception as e:
         print(f"--- [ERROR] Callback failed for {user_number}: {e} ---")
+# sending sms to user
+def send_summary_sms(to_number, summary_text):
+    try:
+        message = client.messages.create(
+            body=summary_text,
+            from_=TWILIO_PHONE_NUMBER,
+            to=to_number,
+            status_callback=f"{BASE_URL}/sms-status"
+        )
 
+        print(f"--- [SMS SENT] SID: {message.sid} ---")
+
+    except Exception as e:
+        print(f"--- [SMS ERROR] {e} ---")
+
+@app.api_route("/call-status", methods=["POST"])
+async def call_status(CallSid: str = Form(None), CallStatus: str = Form(None), To: str = Form(None)):
+    print(f"--- [CALL STATUS] Call {CallSid} is {CallStatus} to {To} ---")
+    if CallStatus in ["completed", "canceled", "failed", "no-answer"]:
+        if CallSid in session_state:
+            state = session_state[CallSid]
+            chapter = state.get("chapter", "None")
+            score = state.get("quiz_score", 0)
+            summary_text = f"CallSakhi Summary\n\nChapter: {chapter.title() if chapter else 'None'}\nScore: {score}/3"
+            
+            if chapter and chapter != "None":
+                context = get_relevant_context(f"main concepts of {chapter}", chapter=chapter)
+                prompt = (f"LOCKED CHAPTER: {chapter}.\n"
+                          f"USE ONLY this textbook context:\n---\n{context}\n---\n"
+                          f"Provide a brief 2-sentence summary of the main concepts of this chapter for a 10th-grade student. Do not include any conversational filler.")
+                try:
+                    concept_summary = _run_llm([{"role": "user", "content": prompt}], max_tokens=150)
+                    summary_text += f"\n\nConcepts Discussed:\n{concept_summary.strip()}"
+                except Exception as e:
+                    print(f"--- [ERROR] Failed to generate concept summary for SMS: {e} ---")
+            
+            # Use 'To' phone number as it's the user's phone number
+            if To:
+                send_summary_sms(To, summary_text)
+            
+            # Clean up sessions to avoid memory leak
+            session_state.pop(CallSid, None)
+            sessions.pop(CallSid, None)
+    return Response(status_code=200)
+
+@app.api_route("/sms-status", methods=["POST"])
+async def sms_status(MessageSid: str = Form(None), MessageStatus: str = Form(None)):
+    print(f"--- [SMS STATUS] Message {MessageSid} status: {MessageStatus} ---")
+    return Response(status_code=200)
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(background_tasks: BackgroundTasks, From: str = Form(None), request: Request = None):
     # Get caller number
@@ -440,8 +491,17 @@ async def handle_response(CallSid: str = Form(None), SpeechResult: str = Form(No
         CallSid = request.query_params.get("CallSid", "unknown")
     
     user_input = Digits or SpeechResult
+    # call summary
+    save_message(CallSid, "student", user_input)
     print(f"--- [RESPONSE] CallSid: {CallSid}, User said/typed: {user_input} ---")
     response = VoiceResponse()
+    
+    # Intercept "bye" early
+    if user_input and "bye" in user_input.lower():
+        response.say("Namaste and goodbye! Thank you for studying with Savitri.", voice=VOICE_NAME, language=LANGUAGE_CODE)
+        response.hangup()
+        print(f"--- [HANGUP] User said bye. Ending call for {CallSid} ---")
+        return Response(content=str(response), media_type="application/xml")
     
     if not user_input:
         # Don't restart from beginning if student is in an active session
@@ -470,7 +530,7 @@ async def handle_response(CallSid: str = Form(None), SpeechResult: str = Form(No
         return Response(content=str(response), media_type="application/xml")
 
     ai_text = get_ai_response(CallSid, user_input)
-
+    save_message(CallSid, "agent", ai_text)
     if any(bye in ai_text.lower() for bye in ["goodbye", "namaste and goodbye"]):
         response.say(ai_text, voice=VOICE_NAME, language=LANGUAGE_CODE)
         response.hangup()
