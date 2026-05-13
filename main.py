@@ -5,6 +5,7 @@ from services.db_service import save_message
 from groq import Groq
 from fastapi import FastAPI, Form, Response, BackgroundTasks, Request
 from twilio.rest import Client
+from datetime import datetime
 from twilio.twiml.voice_response import VoiceResponse
 from dotenv import load_dotenv
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -19,6 +20,10 @@ load_dotenv(dotenv_path=env_path)
 print(f"--- [DEBUG] Loading env from: {env_path}")
 
 app = FastAPI()
+
+# Mount Analytics Dashboard Routes (Isolated from live call paths)
+from analytics.routes import router as analytics_router
+app.include_router(analytics_router, prefix="/api/analytics")
 
 # Credentials
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -48,7 +53,7 @@ You are Savitri, a strict Class 10 Science tutor for Indian students.
 6. Use simple English for a 10th-grade student.
 
 === MODES ===
-CONCEPT mode: Give exactly 3 bullet points from the context. End with: "Do you have any doubts?"
+CONCEPT mode: Extract key concepts from the context using bullet points.
 QUIZ mode: Ask 1 MCQ at a time (4 options: A, B, C, D). Wait for answer. After 3 questions give a score.
 REVISION mode: List 5 key exam points from the context only.
 """
@@ -214,10 +219,15 @@ def get_ai_response(call_sid, user_input):
                 "chapter": None, "chapter_num": None, "stage": "chapter_selection",
                 "mode": None,
                 "quiz_q_num": 0, "quiz_score": 0,
-                "quiz_awaiting_answer": False, "quiz_correct_answer": None
+                "quiz_awaiting_answer": False, "quiz_correct_answer": None,
+                "start_time": datetime.utcnow().isoformat() + "Z", "engagement_score": 0
             }
 
         state = session_state[call_sid]
+        
+        # Increment engagement score for each interaction
+        if user_input_norm:
+            state["engagement_score"] = state.get("engagement_score", 0) + 1
 
         # ── STAGE 1: CHAPTER SELECTION ──────────────────────────────────
         if state["stage"] == "chapter_selection":
@@ -295,13 +305,13 @@ def get_ai_response(call_sid, user_input):
 
         # ── CONCEPT ──────────────────────────────────────────────────────
         if mode == "explain":
-            context = get_relevant_context(f"main concepts definition of {chapter}", chapter=chapter)
+            context = get_relevant_context(f"core educational concepts and important definitions of {chapter}", chapter=chapter)
             start = time.time()
             if context:
                 prompt = (f"LOCKED CHAPTER: {chapter}. Mode: CONCEPT.\n"
                           f"USE ONLY this textbook context:\n---\n{context}\n---\n"
-                          f"Give exactly 3 bullet points on the key concepts. "
-                          f"After the points end with exactly: '{MODE_MENU}'")
+                          f"Extract up to 3 clear bullet points explaining the core concepts. If the context is limited, extract what you can.\n"
+                          f"After the points, end your response with exactly this text: '{MODE_MENU}'")
             else:
                 return f"I could not find content for {chapter.title()}. {MODE_MENU}"
             ai_text = "You have chosen Concept Explanation. " + _run_llm(
@@ -407,7 +417,7 @@ def send_summary_sms(to_number, summary_text):
         print(f"--- [SMS ERROR] {e} ---")
 
 @app.api_route("/call-status", methods=["POST"])
-async def call_status(CallSid: str = Form(None), CallStatus: str = Form(None), To: str = Form(None)):
+async def call_status(background_tasks: BackgroundTasks, CallSid: str = Form(None), CallStatus: str = Form(None), To: str = Form(None), CallDuration: int = Form(None)):
     print(f"--- [CALL STATUS] Call {CallSid} is {CallStatus} to {To} ---")
     if CallStatus in ["completed", "canceled", "failed", "no-answer"]:
         if CallSid in session_state:
@@ -430,6 +440,11 @@ async def call_status(CallSid: str = Form(None), CallStatus: str = Form(None), T
             # Use 'To' phone number as it's the user's phone number
             if To:
                 send_summary_sms(To, summary_text)
+            
+            # --- TRIGGER ANALYTICS ---
+            from analytics.pipeline import process_analytics_post_call
+            state_copy = state.copy()
+            background_tasks.add_task(process_analytics_post_call, CallSid, To, state_copy, CallDuration)
             
             # Clean up sessions to avoid memory leak
             session_state.pop(CallSid, None)
