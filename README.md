@@ -113,7 +113,7 @@ The dashboard provides real-time telemetry on:
 - **Average Quiz Accuracy** per chapter.
 - **Live Mission Monitor**: Real-time log of active sessions.
 
-![CallSakhi Analytics Dashboard](dashboard_screenshot.png)
+![CallSakhi Analytics Dashboard](dashboard_screenshot.jpeg)
 
 ---
 
