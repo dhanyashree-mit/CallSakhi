@@ -88,13 +88,7 @@ def load_db():
     try:
         print("--- [AI] Connecting to MongoDB Atlas... ---", flush=True)
         # Using both options for maximum compatibility
-        client = MongoClient(
-            current_uri, 
-            tls=True,
-            tlsCAFile=certifi.where(),
-            # tlsAllowInvalidCertificates=True, 
-            serverSelectionTimeoutMS=30000 
-        )
+        client = MongoClient(current_uri)
         
         print("--- [AI] Pinging MongoDB... ---", flush=True)
         try:
@@ -179,17 +173,21 @@ def get_chapter_from_input(user_input):
 def get_relevant_context(query, chapter=None):
     if vector_search:
         try:
-            search_kwargs = {"k": 5}
-            if chapter:
-                # CRITICAL FIX: the field in MongoDB is flat 'chapter', NOT 'metadata.chapter'
-                search_kwargs["pre_filter"] = {"chapter": {"$eq": chapter}}
-                query = f"{chapter} {query}"
+            # Robust search: include chapter in query but don't force strict filtering
+            search_query = f"{chapter} {query}" if chapter else query
+            print(f"--- [RAG] Searching for: {search_query} ---")
+            docs = vector_search.similarity_search(search_query, k=10)
             
-            docs = vector_search.similarity_search(query, **search_kwargs)
+            # Fallback: if no results, try searching without the chapter prefix
+            if not docs and chapter:
+                print(f"--- [RAG FALLBACK] No results with chapter prefix, searching query only... ---")
+                docs = vector_search.similarity_search(query, k=10)
+
             if not docs:
-                print(f"--- [WARNING] No documents found in chapter '{chapter}' for query: {query} ---")
-            else:
-                print(f"--- [RAG] Found {len(docs)} chunks for chapter '{chapter}' ---")
+                print(f"--- [WARNING] No documents found in database for: {query} ---")
+                return ""
+                
+            print(f"--- [SUCCESS] Found {len(docs)} relevant chunks ---")
             return "\n".join([doc.page_content for doc in docs])
         except Exception as e:
             print(f"--- [ERROR] MongoDB Search failed: {e} ---")
@@ -465,7 +463,13 @@ async def handle_incoming_call(background_tasks: BackgroundTasks, From: str = Fo
         return Response(content="<Response><Say>Server live!</Say></Response>", media_type="application/xml")
     
     print(f"--- [INCOMING] Call from: {From} ---")
-    background_tasks.add_task(trigger_callback, From)
+    
+    # Normalize phone number: Ensure it starts with '+'
+    clean_from = From.strip()
+    if not clean_from.startswith('+'):
+        clean_from = '+' + clean_from
+    
+    background_tasks.add_task(trigger_callback, clean_from)
     
     response = VoiceResponse()
     response.reject(reason="busy") # Hang up so we can call them back

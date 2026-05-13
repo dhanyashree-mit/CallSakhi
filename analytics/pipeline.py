@@ -13,22 +13,12 @@ def get_analytics_collection():
         uri = os.getenv("MONGODB_URI")
         if not uri:
             return None
-        _mongo_client = MongoClient(
-            uri,
-            tls=True,
-            tlsCAFile=certifi.where(),
-            serverSelectionTimeoutMS=15000
-        )
+        _mongo_client = MongoClient(uri)
     try:
         _mongo_client.admin.command('ping')
     except Exception:
         # Reconnect on ping failure
-        _mongo_client = MongoClient(
-            os.getenv("MONGODB_URI"),
-            tls=True,
-            tlsCAFile=certifi.where(),
-            serverSelectionTimeoutMS=15000
-        )
+        _mongo_client = MongoClient(os.getenv("MONGODB_URI"))
     return _mongo_client["callsakhi_analytics"]["call_analytics"]
 
 def process_analytics_post_call(call_sid: str, student_number: str, state_data: dict, call_duration: int = None):

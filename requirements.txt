@@ -12,3 +12,7 @@ langchain-community
 pypdf
 pymongo[srv]
 langchain-mongodb
+supabase
+streamlit
+plotly
+pandas

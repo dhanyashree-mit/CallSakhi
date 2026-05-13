@@ -1,102 +1,116 @@
 # CallSakhi AI Voice Tutor 📞🎓
 
-CallSakhi is an AI-powered voice tutor designed to help students in India study Science chapters through a simple phone call. It uses Twilio for telephony, Groq for the AI brain, and FastAPI for the backend.
+CallSakhi is a state-of-the-art AI-powered voice tutor designed to bridge the educational gap for students in India. It enables students to study Science chapters through a natural phone conversation—no internet or smartphone required on the student's end.
+
+---
+
+## 🌟 Key Features
+- **Voice-First Learning**: Natural conversation with "Savitri," a strict but helpful Science tutor.
+- **RAG Powered**: Uses **MongoDB Atlas Vector Search** to ensure the AI only teaches from verified textbook content.
+- **Multi-Mode Education**:
+  - **Concept Mode**: Explains core definitions and ideas.
+  - **Quiz Mode**: Interactive MCQs with scoring.
+  - **Revision Mode**: Summary of key exam points.
+- **Analytics Dashboard**: A premium **Streamlit** dashboard to track student engagement, accuracy, and call telemetry.
+- **Automated Summaries**: Sends a post-call SMS summary to the student via Twilio.
+
+---
+
+## 🛠️ Tech Stack
+- **FastAPI**: High-performance Python backend.
+- **Twilio**: Telephony and SMS API.
+- **Groq (Llama 3.1)**: Ultra-fast AI inference.
+- **MongoDB Atlas**: Vector database for RAG (Retrieval-Augmented Generation).
+- **Supabase**: Session logging and message persistence.
+- **Streamlit**: Real-time analytics dashboard.
+- **Cloudflare Tunnels**: Secure local-to-internet bridging.
+
+---
 
 ## 🚀 Setup Instructions
 
 ### 1. Prerequisites
-- Python 3.8 or higher installed.
-- A Twilio Account (Sign up at [twilio.com](https://www.twilio.com)).
-- A Groq API Key (Get it from [console.groq.com](https://console.groq.com)).
-- `cloudflared` installed (To expose your local server to the internet).
+- **Python 3.9+**
+- **Twilio Account** (SID, Auth Token, and a Phone Number)
+- **Groq API Key**
+- **MongoDB Atlas Cluster** (with Vector Search enabled)
+- **Cloudflared** installed on your machine.
 
-### 2. Twilio Configuration
-1. Log in to your **Twilio Console**.
-2. Buy or get a **Trial Phone Number**.
-3. Note down your **Account SID**, **Auth Token**, and your **Twilio Phone Number**.
-4. (Optional) For high-quality Indian English voice, ensure "Polly" voices are enabled in your Twilio account settings.
+### 2. Environment Configuration
+Create a `.env` file in the root directory:
 
-### 3. Local Project Setup
-1. **Clone the repository**:
-   ```bash
-   git clone <your-repo-url>
-   cd CallSakhi
-   ```
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Configure Environment Variables**:
-   Create a file named `.env` in the root folder and copy the following (replacing with your own keys):
-   ```env
-   # Twilio Credentials
-   TWILIO_ACCOUNT_SID=your_account_sid_here
-   TWILIO_AUTH_TOKEN=your_auth_token_here
-   TWILIO_PHONE_NUMBER=your_twilio_number_here
+```env
+# Twilio
+TWILIO_ACCOUNT_SID=your_sid
+TWILIO_AUTH_TOKEN=your_token
+TWILIO_PHONE_NUMBER=your_number
 
-   # AI API Keys
-   GROQ_API_KEY=your_groq_api_key_here
+# AI & DB
+GROQ_API_KEY=your_groq_key
+MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/callsakhi?retryWrites=true&w=majority&tls=true&tlsAllowInvalidCertificates=true
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_key
 
-   # Tunnel URL (Update this every time you restart your tunnel)
-   BASE_URL=https://your-unique-tunnel-id.trycloudflare.com
-   ```
+# Tunnel URL (Must match cloudflared output)
+BASE_URL=https://your-unique-id.trycloudflare.com
+```
 
-### 4. Running the Application
+### 3. Installation
+```powershell
+pip install -r requirements.txt
+```
 
-Follow these steps in order:
+### 4. Knowledge Base Ingestion
+Place your Science textbooks (PDFs) in the `knowledge_base/` folder, then run:
+```powershell
+python ingest.py
+```
+*Note: Ensure you create a Vector Index in Atlas UI named `vector_index` mapping the `embedding` field.*
 
-#### Step A: Start the Tunnel
-In a new terminal window, run:
-```bash
+---
+
+## 🚦 How to Run
+
+### Step 1: Start the Tunnel
+```powershell
 ./cloudflared tunnel --url http://127.0.0.1:8000
 ```
-Look for a line in the output that looks like:
-`https://random-words-here.trycloudflare.com`
-**Copy this URL** and paste it as your `BASE_URL` in the `.env` file.
+**Copy the `https://...` URL** and update your `.env` (BASE_URL) and Twilio Webhook.
 
-#### Step B: Start the Server
-In another terminal window, run:
-```bash
+### Step 2: Start the Main Server
+```powershell
 python main.py
 ```
 
-#### Step C: Configure Twilio
-
-
-**Option 2: TwiML Bin**
-1. Go to **Twilio Console** > **Runtime** > **TwiML Bins** > **Create New Bin**.
-2. **Friendly Name**: `CallSakhi Trigger`.
-3. **TwiML Value**:
-   ```xml
-   <?xml version="1.0" encoding="UTF-8"?>
-   <Response>
-       <!-- This notifies your server then rejects the call -->
-       <Redirect method="POST">https://your-tunnel.trycloudflare.com/incoming-call</Redirect>
-   </Response>
-   ```
-4. Go to your **Phone Number** settings.
-5. Under "A CALL COMES IN", select **TwiML Bin** and pick `CallSakhi Trigger`.
-6. Click **Save**.
-
-### 5. Start a Lesson!
-
-**Method A: Call the Number**
-This will cost 0.5 for each call .Instaed try the second option of triggering the call from terminal 
-Just call your Twilio phone number from your mobile. The call will hang up immediately, and Savitri will call you back in 3 seconds.
-
-**Method B: Trigger from Terminal (Quick Test)**
-If you don't want to call the number, you can "force" a callback from your terminal. Replace `+91XXXXXXXXXX` with your actual phone number:
-
-**Windows (PowerShell):**
+### Step 3: Start the Analytics Dashboard
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/incoming-call" -Method Post -Body "From=+91XXXXXXXXXX"
+streamlit run dashboard/app.py
 ```
 
+---
 
+## 🔧 Troubleshooting
+
+### "Application Error" on Call
+1. **URL Mismatch**: Ensure your Cloudflare URL matches the one in your Twilio Console "A Call Comes In" webhook.
+2. **Missing '+'**: Ensure you call with your full international number (e.g., `+91...`).
+3. **Server Startup**: Wait for the "Uvicorn running" message before calling.
+
+### SSL Handshake Errors (Windows)
+If you see `SSL: TLSV1_ALERT_INTERNAL_ERROR`, ensure your `MONGODB_URI` contains `&tls=true&tlsAllowInvalidCertificates=true`. We have implemented a bypass in the code to handle these local certificate issues on Windows.
+
+### Content Not Found
+If Savitri says she can't find the chapter, ensure:
+- The PDF filename matches the chapter name (e.g., `Electricity.pdf`).
+- You have run `ingest.py` recently.
+- Your Atlas Vector Search index is named `vector_index`.
 
 ---
-## 🛠️ Tech Stack
-- **FastAPI**: Backend framework.
-- **Twilio**: Voice API.
-- **Groq (Llama 3.1)**: AI Model for conversation.
-- **Cloudflare Tunnels**: Secure local-to-internet access.
+
+## 📊 Analytics Dashboard
+The dashboard provides real-time telemetry on:
+- **Total Calls** & **Students Helped**.
+- **Average Quiz Accuracy** per chapter.
+- **Live Mission Monitor**: Real-time log of active sessions.
+
+Built with 🧡 for the CallSakhi Mission.
