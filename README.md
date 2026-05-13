@@ -120,6 +120,6 @@ The dashboard provides real-time telemetry on:
 ## 📱 User Experience
 After every session, students receive an automated SMS summary of their performance and the key concepts discussed:
 
-![CallSakhi SMS Summary](sms_screenshot.png)
+![CallSakhi SMS Summary](sms_screenshot.jpeg)
 
-Built with 🧡 for the CallSakhi Mission.
+
